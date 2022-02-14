@@ -1,0 +1,4 @@
+---
+# As of Clang 13, this is the default clang-format
+# style. We ensure this is the same going forward.
+BasedOnStyle: LLVM

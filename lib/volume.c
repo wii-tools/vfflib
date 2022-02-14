@@ -25,7 +25,7 @@ bool volume_read(struct volume *volume, void *buffer, uint64_t loc,
                  uint64_t count) {
   // Seek to where we need, and read.
   fseek(volume->vff, loc, SEEK_SET);
-  int result = fread(buffer, count, 1, volume->vff);
+  int result = fread(buffer, 1, count, volume->vff);
 
   // Return whether we read the amount we intended.
   return result == count;

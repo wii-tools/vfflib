@@ -11,46 +11,29 @@
 #include <stdbool.h>
 #include <string.h>
 
+#include "local_endian.h"
+
 #define FAT32_LFN_MAX_ENTRIES 20
 #define FAT32_LFN_MAX_FILENAME_LENGTH (FAT32_LFN_MAX_ENTRIES * 13 + 1)
 
-#define FAT32_VALID_SIGNATURE_1 0x28
-#define FAT32_VALID_SIGNATURE_2 0x29
-#define FAT32_VALID_SYSTEM_IDENTIFIER "FAT32   "
-#define FAT16_VALID_SYSTEM_IDENTIFIER "FAT16   "
+#define VFF_MAGIC "VFF "
+#define VFF_BOM_BE 0xFEFF0100
+#define VFF_BOM_LE 0xFFEF0100
+#define VFF_HEADER_SIZE 0x20
 #define FAT12_VALID_SYSTEM_IDENTIFIER "FAT12   "
 #define FAT32_ATTRIBUTE_SUBDIRECTORY 0x10
 #define FAT32_LFN_ATTRIBUTE 0x0F
 
 #pragma pack(push, 1)
-struct fat32_bpb {
-  uint8_t jump[3];
-  char oem[8];
-  uint16_t bytes_per_sector;
-  uint8_t sectors_per_cluster;
-  uint16_t reserved_sectors;
-  uint8_t fats_count;
-  uint16_t directory_entries_count;
-  uint16_t sector_totals;
-  uint8_t media_descriptor_type;
-  uint16_t sectors_per_fat_16;
-  uint16_t sectors_per_track;
-  uint16_t heads_count;
-  uint32_t hidden_sectors_count;
-  uint32_t large_sectors_count;
-  uint32_t sectors_per_fat_32;
-  uint16_t flags;
-  uint16_t fat_version_number;
-  uint32_t root_directory_cluster;
-  uint16_t fs_info_sector;
-  uint16_t backup_boot_sector;
-  uint8_t reserved[12];
-  uint8_t drive_number;
-  uint8_t nt_flags;
-  uint8_t signature;
-  uint32_t volume_serial_number;
-  char label[11];
-  char system_identifier[8];
+struct vff_header {
+  char magic[4];
+  uint32_t byte_order_marker;
+  uint32_t volume_size;
+  uint16_t cluster_size;
+  uint16_t padding;
+  // Set to 0x0 or 0x1 based on unknown factors.
+  uint8_t unknown;
+  uint8_t reserved[15];
 };
 
 struct fat32_directory_entry {
@@ -79,48 +62,62 @@ static int fat32_init_context(struct fat32_context *context,
                               struct volume *part) {
   context->part = part;
 
-  struct fat32_bpb bpb;
-  volume_read(context->part, &bpb, 0, sizeof(struct fat32_bpb));
+  struct vff_header header;
+  volume_read(context->part, &header, 0, sizeof(struct vff_header));
 
-  if (strncmp(bpb.system_identifier, FAT32_VALID_SYSTEM_IDENTIFIER,
-              SIZEOF_ARRAY(bpb.system_identifier)) == 0) {
-    if (bpb.signature == FAT32_VALID_SIGNATURE_1 ||
-        bpb.signature == FAT32_VALID_SIGNATURE_2) {
-      context->type = 32;
-      goto valid;
-    }
+  // Validate magic
+  if (strncmp(header.magic, VFF_MAGIC, 4) != 0) {
+    return 1;
   }
 
-  if (strncmp((((void *)&bpb) + 0x36), FAT16_VALID_SYSTEM_IDENTIFIER,
-              SIZEOF_ARRAY(bpb.system_identifier)) == 0) {
+  // Somewhat ironically, we cannot depend on the upper byte order marker.
+  // For server-side VFFs, the header's cluster size will be in little endian.
+  // Endianness is hard :)
+  // However, we can depend on the lower value being 0x0100.
+  uint32_t bom = be32toh(header.byte_order_marker);
+  if (bom == VFF_BOM_BE) {
+    context->is_big_endian = true;
+  } else if (bom == VFF_BOM_LE) {
+    context->is_big_endian = false;
+  } else {
+    return 1;
+  }
+
+  // For an unknown reason, the cluster size must be multiplied by 16.
+  // (It should always be 512, but we support variable sizes just in case.)
+  if (context->is_big_endian == true) {
+    context->cluster_size = be16toh(header.cluster_size) * 16;
+  } else {
+    context->cluster_size = le16toh(header.cluster_size) * 16;
+  }
+
+  uint32_t volume_size = be32toh(header.volume_size);
+
+  // Determine the cluster count based on from cluster size
+  // and volume size. This size is not given to us otherwise.
+  uint32_t cluster_count = volume_size / context->cluster_size;
+
+  // We now determine the FAT type.
+  // 32, 16 or 12 are possible.
+  if (cluster_count >= 0xFFF5) {
+    context->type = 32;
+  } else if (cluster_count >= 0xFF5) {
     context->type = 16;
-    goto valid;
-  }
-
-  if (strncmp((((void *)&bpb) + 0x36), FAT12_VALID_SYSTEM_IDENTIFIER,
-              SIZEOF_ARRAY(bpb.system_identifier)) == 0) {
+  } else {
     context->type = 12;
-    goto valid;
   }
 
-  return 1;
+  // We must have two FATs per VFF.
+  context->number_of_fats = 2;
 
-valid:
-  context->bytes_per_sector = bpb.bytes_per_sector;
-  context->sectors_per_cluster = bpb.sectors_per_cluster;
-  context->reserved_sectors = bpb.reserved_sectors;
-  context->number_of_fats = bpb.fats_count;
-  context->hidden_sectors = bpb.hidden_sectors_count;
-  context->sectors_per_fat =
-      context->type == 32 ? bpb.sectors_per_fat_32 : bpb.sectors_per_fat_16;
-  context->root_directory_cluster = bpb.root_directory_cluster;
-  context->fat_start_lba = bpb.reserved_sectors;
-  context->root_entries = bpb.directory_entries_count;
-  context->root_start = context->reserved_sectors +
-                        context->number_of_fats * context->sectors_per_fat;
-  context->root_size =
-      DIV_ROUNDUP(context->root_entries * sizeof(struct fat32_directory_entry),
-                  context->bytes_per_sector);
+  context->root_directory_cluster = 0;
+  context->root_entries = cluster_count * 2;
+  context->root_start = context->number_of_fats * context->cluster_size;
+
+  context->root_size = context->cluster_size * 2;
+  context->root_size = (context->root_size + context->cluster_size - 1) &
+                       ~(context->cluster_size - 1);
+
   switch (context->type) {
   case 12:
   case 16:
@@ -130,7 +127,8 @@ valid:
     context->data_start_lba = context->root_start;
     break;
   default:
-    __builtin_unreachable();
+    // This should not occur.
+    return 1;
   }
 
   return 0;
@@ -142,10 +140,7 @@ static int read_cluster_from_map(struct fat32_context *context,
   case 12: {
     *out = 0;
     uint16_t tmp = 0;
-    volume_read(context->part, &tmp,
-                context->fat_start_lba * context->bytes_per_sector +
-                    (cluster + cluster / 2),
-                sizeof(uint16_t));
+    volume_read(context->part, &tmp, (cluster + cluster / 2), sizeof(uint16_t));
     if (cluster % 2 == 0) {
       *out = tmp & 0xfff;
     } else {
@@ -155,20 +150,16 @@ static int read_cluster_from_map(struct fat32_context *context,
   }
   case 16:
     *out = 0;
-    volume_read(context->part, out,
-                context->fat_start_lba * context->bytes_per_sector +
-                    cluster * sizeof(uint16_t),
+    volume_read(context->part, out, cluster * sizeof(uint16_t),
                 sizeof(uint16_t));
     break;
   case 32:
-    volume_read(context->part, out,
-                context->fat_start_lba * context->bytes_per_sector +
-                    cluster * sizeof(uint32_t),
+    volume_read(context->part, out, cluster * sizeof(uint32_t),
                 sizeof(uint32_t));
     *out &= 0x0fffffff;
     break;
   default:
-    __builtin_unreachable();
+    return 1;
   }
 
   return 0;
@@ -202,7 +193,7 @@ static uint32_t *cache_cluster_chain(struct fat32_context *context,
 static bool read_cluster_chain(struct fat32_context *context,
                                uint32_t *cluster_chain, void *buf, uint64_t loc,
                                uint64_t count) {
-  size_t block_size = context->sectors_per_cluster * context->bytes_per_sector;
+  size_t block_size = context->cluster_size;
   for (uint64_t progress = 0; progress < count;) {
     uint64_t block = (loc + progress) / block_size;
 
@@ -212,9 +203,8 @@ static bool read_cluster_chain(struct fat32_context *context,
       chunk = block_size - offset;
 
     uint64_t base =
-        ((uint64_t)context->data_start_lba +
-         (cluster_chain[block] - 2) * context->sectors_per_cluster) *
-        context->bytes_per_sector;
+        ((uint64_t)context->data_start_lba + (cluster_chain[block] - 2)) *
+        context->cluster_size;
     volume_read(context->part, buf + progress, base + offset, chunk);
 
     progress += chunk;
@@ -263,7 +253,7 @@ static bool fat32_filename_to_8_3(char *dest, const char *src) {
 static int fat32_open_in(struct fat32_context *context,
                          struct fat32_directory_entry *directory,
                          struct fat32_directory_entry *file, const char *name) {
-  size_t block_size = context->sectors_per_cluster * context->bytes_per_sector;
+  size_t block_size = context->cluster_size;
   char current_lfn[FAT32_LFN_MAX_FILENAME_LENGTH] = {0};
 
   size_t dir_chain_len;
@@ -294,7 +284,7 @@ static int fat32_open_in(struct fat32_context *context,
     directory_entries = malloc(dir_chain_len * block_size);
 
     volume_read(context->part, directory_entries,
-                context->root_start * context->bytes_per_sector,
+                context->root_start * context->cluster_size,
                 context->root_entries * sizeof(struct fat32_directory_entry));
   }
 
@@ -407,7 +397,7 @@ bool fat32_open(struct fat32_file_handle *ret, struct volume *part,
     current_directory = &_current_directory;
     break;
   default:
-    __builtin_unreachable();
+    return false;
   }
 
   for (;;) {
@@ -444,7 +434,7 @@ bool fat32_open(struct fat32_file_handle *ret, struct volume *part,
       if (context.type == 32)
         ret->first_cluster |= (uint64_t)current_file.cluster_num_high << 16;
       ret->size_clusters =
-          DIV_ROUNDUP(current_file.file_size_bytes, context.bytes_per_sector);
+          DIV_ROUNDUP(current_file.file_size_bytes, context.cluster_size);
       ret->size_bytes = current_file.file_size_bytes;
       ret->cluster_chain =
           cache_cluster_chain(&context, ret->first_cluster, &ret->chain_len);

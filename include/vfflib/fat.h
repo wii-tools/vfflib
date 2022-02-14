@@ -19,13 +19,9 @@
 struct fat32_context {
   struct volume *part;
   int type;
-  uint16_t bytes_per_sector;
-  uint8_t sectors_per_cluster;
-  uint16_t reserved_sectors;
+  bool is_big_endian;
+  uint16_t cluster_size;
   uint8_t number_of_fats;
-  uint32_t hidden_sectors;
-  uint32_t sectors_per_fat;
-  uint32_t fat_start_lba;
   uint32_t data_start_lba;
   uint32_t root_directory_cluster;
   uint16_t root_entries;
